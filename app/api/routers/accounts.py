@@ -7,7 +7,12 @@ from uuid import UUID
 from fastapi import APIRouter, Query, status
 
 from app.api.deps import SessionDep, TenantDep
-from app.api.schemas import AccountCreate, AccountOut, BalanceOut
+from app.api.schemas import (
+    AccountCreate,
+    AccountOut,
+    BalanceOut,
+    StatementEntryOut,
+)
 from app.services import accounts as account_service
 from app.services import balances as balance_service
 
@@ -57,3 +62,19 @@ async def get_account_balance(
 ) -> BalanceOut:
     view = await balance_service.get_account_balance(session, tenant.id, account_id)
     return BalanceOut.from_view(view)
+
+
+@router.get("/{account_id}/statement", response_model=list[StatementEntryOut])
+async def get_account_statement(
+    account_id: UUID,
+    tenant: TenantDep,
+    session: SessionDep,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> list[StatementEntryOut]:
+    """Chronological postings for an account, each with the running balance it
+    produced — a ready-to-render statement."""
+    entries = await balance_service.account_statement(
+        session, tenant.id, account_id, limit=limit, offset=offset
+    )
+    return [StatementEntryOut.from_entry(e) for e in entries]

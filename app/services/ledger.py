@@ -23,7 +23,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.domain.enums import Direction
+from app.domain.enums import AccountType, Direction, balance_sign, normal_balance
 from app.domain.errors import (
     AccountNotFoundError,
     AlreadyReversedError,
@@ -80,32 +80,79 @@ async def _find_by_idempotency_key(
     )
 
 
-async def _apply_to_balances(
-    session: AsyncSession,
-    *,
-    deltas: dict[uuid.UUID, tuple[int, int]],
-) -> None:
-    """Lock the affected balance rows and add ``(debit, credit)`` deltas.
-
-    Rows are locked ``FOR UPDATE`` in a deterministic (sorted) order so that
-    concurrent transactions touching overlapping accounts can never deadlock.
-    """
-    account_ids = sorted(deltas)
-    balances = (
+async def _lock_balances(
+    session: AsyncSession, account_ids
+) -> dict[uuid.UUID, AccountBalance]:
+    """Lock the affected balance rows ``FOR UPDATE`` in a deterministic (sorted)
+    order so concurrent transactions touching overlapping accounts can never
+    deadlock."""
+    ids = sorted(account_ids)
+    rows = (
         await session.execute(
             select(AccountBalance)
-            .where(AccountBalance.account_id.in_(account_ids))
+            .where(AccountBalance.account_id.in_(ids))
             .order_by(AccountBalance.account_id)
             .with_for_update()
         )
     ).scalars().all()
+    return {b.account_id: b for b in rows}
 
-    by_id = {b.account_id: b for b in balances}
-    for account_id in account_ids:
-        balance = by_id.get(account_id)
-        if balance is None:  # pragma: no cover - balance row created with account
-            raise AccountNotFoundError(f"no balance row for account {account_id}")
-        debit_delta, credit_delta = deltas[account_id]
+
+def _signed_balance(balance: AccountBalance, account_type: AccountType) -> int:
+    """The account's signed balance in minor units, per its normal-balance side."""
+    debits, credits = int(balance.posted_debits), int(balance.posted_credits)
+    if normal_balance(account_type) is Direction.DEBIT:
+        return debits - credits
+    return credits - debits
+
+
+async def _write_postings(
+    session: AsyncSession,
+    *,
+    transaction_id: uuid.UUID,
+    accounts: dict[uuid.UUID, Account],
+    rows: list[dict],
+    deltas: dict[uuid.UUID, tuple[int, int]],
+) -> None:
+    """Persist postings with a per-line running-balance snapshot and apply the
+    net per-account deltas to the materialised balances.
+
+    The balance rows are locked first, then ``rows`` is walked *in order* and
+    each posting is stamped with the account's signed ``balance_before`` /
+    ``balance_after`` as it is threaded. The aggregate ``deltas`` then move the
+    stored balance once per account (a single version bump); the final threaded
+    value equals the new stored balance by construction.
+    """
+    balances = await _lock_balances(session, deltas.keys())
+    missing = deltas.keys() - balances.keys()
+    if missing:  # pragma: no cover - balance row is created with the account
+        raise AccountNotFoundError(f"no balance row for accounts {sorted(missing)}")
+
+    running = {
+        account_id: _signed_balance(balance, AccountType(accounts[account_id].type))
+        for account_id, balance in balances.items()
+    }
+
+    postings: list[Posting] = []
+    for row in rows:
+        account = accounts[row["account_id"]]
+        sign = balance_sign(AccountType(account.type), Direction(row["direction"]))
+        before = running[account.id]
+        after = before + sign * row["amount"]
+        running[account.id] = after
+        postings.append(
+            Posting(
+                transaction_id=transaction_id,
+                balance_before=before,
+                balance_after=after,
+                **row,
+            )
+        )
+    session.add_all(postings)
+    await session.flush()
+
+    for account_id, (debit_delta, credit_delta) in deltas.items():
+        balance = balances[account_id]
         balance.posted_debits = int(balance.posted_debits) + debit_delta
         balance.posted_credits = int(balance.posted_credits) + credit_delta
         balance.version += 1
@@ -219,12 +266,13 @@ async def post_transaction(
     session.add(transaction)
     await session.flush()  # assign transaction.id
 
-    session.add_all(
-        Posting(transaction_id=transaction.id, **row) for row in rows
+    await _write_postings(
+        session,
+        transaction_id=transaction.id,
+        accounts=accounts,
+        rows=rows,
+        deltas=deltas,
     )
-    await session.flush()
-
-    await _apply_to_balances(session, deltas=deltas)
 
     try:
         await session.commit()
@@ -280,6 +328,20 @@ async def reverse_transaction(
         if prior is not None:
             return prior
 
+    # Load the referenced accounts so the reversal's postings can be threaded
+    # with their own running-balance snapshot.
+    account_ids = {p.account_id for p in original.postings}
+    accounts = {
+        a.id: a
+        for a in (
+            await session.scalars(
+                select(Account).where(
+                    Account.tenant_id == tenant_id, Account.id.in_(account_ids)
+                )
+            )
+        ).all()
+    }
+
     reversal = Transaction(
         tenant_id=tenant_id,
         description=description or f"Reversal of {original.id}",
@@ -290,28 +352,31 @@ async def reverse_transaction(
     session.add(reversal)
     await session.flush()
 
+    rows: list[dict] = []
     deltas: dict[uuid.UUID, list[int]] = defaultdict(lambda: [0, 0])
     for original_posting in original.postings:
         flipped = Direction(original_posting.direction).opposite
         amount = int(original_posting.amount)
-        session.add(
-            Posting(
-                transaction_id=reversal.id,
-                account_id=original_posting.account_id,
-                tenant_id=tenant_id,
-                direction=flipped.value,
-                amount=amount,
-                currency_code=original_posting.currency_code,
-            )
+        rows.append(
+            {
+                "account_id": original_posting.account_id,
+                "tenant_id": tenant_id,
+                "direction": flipped.value,
+                "amount": amount,
+                "currency_code": original_posting.currency_code,
+            }
         )
         if flipped is Direction.DEBIT:
             deltas[original_posting.account_id][0] += amount
         else:
             deltas[original_posting.account_id][1] += amount
 
-    await session.flush()
-    await _apply_to_balances(
-        session, deltas={k: (v[0], v[1]) for k, v in deltas.items()}
+    await _write_postings(
+        session,
+        transaction_id=reversal.id,
+        accounts=accounts,
+        rows=rows,
+        deltas={k: (v[0], v[1]) for k, v in deltas.items()},
     )
 
     try:

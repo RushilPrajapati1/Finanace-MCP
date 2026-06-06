@@ -16,7 +16,12 @@ from pydantic import BaseModel, Field, PlainSerializer
 
 from app.domain.enums import AccountType, Direction
 from app.domain.money import minor_to_decimal
-from app.services.balances import AccountBalanceView, CurrencyTotals, TrialBalance
+from app.services.balances import (
+    AccountBalanceView,
+    CurrencyTotals,
+    StatementEntry,
+    TrialBalance,
+)
 
 # Serialise Decimal as a plain (non-scientific) string in JSON responses.
 MoneyStr = Annotated[
@@ -92,6 +97,9 @@ class PostingOut(BaseModel):
     direction: Direction
     amount: MoneyStr
     currency: str
+    # Running signed balance of the account before/after this line was applied.
+    balance_before: MoneyStr
+    balance_after: MoneyStr
 
 
 class TransactionOut(BaseModel):
@@ -125,6 +133,12 @@ class TransactionOut(BaseModel):
                         int(p.amount), exponents.get(p.currency_code, 0)
                     ),
                     currency=p.currency_code,
+                    balance_before=minor_to_decimal(
+                        int(p.balance_before), exponents.get(p.currency_code, 0)
+                    ),
+                    balance_after=minor_to_decimal(
+                        int(p.balance_after), exponents.get(p.currency_code, 0)
+                    ),
                 )
                 for p in transaction.postings
             ],
@@ -151,6 +165,33 @@ class BalanceOut(BaseModel):
             debits=view.debits,
             credits=view.credits,
             balance=view.balance,
+        )
+
+
+class StatementEntryOut(BaseModel):
+    """One line of an account statement: a posting plus the running balance it
+    produced."""
+
+    transaction_id: UUID
+    posting_id: UUID
+    direction: Direction
+    amount: MoneyStr
+    balance_after: MoneyStr
+    currency: str
+    description: str | None
+    created_at: datetime
+
+    @classmethod
+    def from_entry(cls, entry: StatementEntry) -> StatementEntryOut:
+        return cls(
+            transaction_id=entry.transaction_id,
+            posting_id=entry.posting_id,
+            direction=entry.direction,
+            amount=entry.amount,
+            balance_after=entry.balance_after,
+            currency=entry.currency,
+            description=entry.description,
+            created_at=entry.created_at,
         )
 
 

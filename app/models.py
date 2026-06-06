@@ -218,6 +218,14 @@ class Posting(Base):
     currency_code: Mapped[str] = mapped_column(
         ForeignKey("currencies.code"), nullable=False
     )
+    # Running-balance snapshot: the account's *signed* balance (minor units,
+    # per its normal-balance side) immediately before and after this line is
+    # applied. Threaded by the posting engine under the same FOR UPDATE lock
+    # that moves the materialised balance, so it is exact and append-only. Lets
+    # a historical balance be read from a single row instead of replaying the
+    # whole posting history, and renders an account statement directly.
+    balance_before: Mapped[int] = mapped_column(Amount, nullable=False)
+    balance_after: Mapped[int] = mapped_column(Amount, nullable=False)
     created_at: Mapped[datetime] = _now()
 
     transaction: Mapped[Transaction] = relationship(back_populates="postings")

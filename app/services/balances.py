@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import func, select
@@ -12,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.domain.enums import AccountType, Direction, normal_balance
 from app.domain.errors import AccountNotFoundError
 from app.domain.money import minor_to_decimal
-from app.models import Account, AccountBalance, Currency, Posting
+from app.models import Account, AccountBalance, Currency, Posting, Transaction
 
 
 @dataclass(slots=True)
@@ -23,6 +24,18 @@ class AccountBalanceView:
     debits: Decimal
     credits: Decimal
     balance: Decimal
+
+
+@dataclass(slots=True)
+class StatementEntry:
+    transaction_id: uuid.UUID
+    posting_id: uuid.UUID
+    direction: Direction
+    amount: Decimal
+    balance_after: Decimal
+    currency: str
+    description: str | None
+    created_at: datetime
 
 
 @dataclass(slots=True)
@@ -70,6 +83,60 @@ async def get_account_balance(
         credits=minor_to_decimal(credits, exponent),
         balance=minor_to_decimal(signed, exponent),
     )
+
+
+async def account_statement(
+    session: AsyncSession,
+    tenant_id: uuid.UUID,
+    account_id: uuid.UUID,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[StatementEntry]:
+    """Return an account's postings in chronological order, each carrying the
+    running balance it produced.
+
+    This is the payoff of the per-posting snapshot: a ready-to-render statement
+    (and the basis for a point-in-time balance) without replaying history.
+    """
+    account = await session.scalar(
+        select(Account).where(
+            Account.id == account_id, Account.tenant_id == tenant_id
+        )
+    )
+    if account is None:
+        raise AccountNotFoundError(f"account {account_id} not found")
+
+    currency = await session.get(Currency, account.currency_code)
+    exponent = currency.exponent if currency else 0
+
+    rows = (
+        await session.execute(
+            select(Posting, Transaction.description)
+            .join(Transaction, Transaction.id == Posting.transaction_id)
+            .where(
+                Posting.account_id == account_id,
+                Posting.tenant_id == tenant_id,
+            )
+            .order_by(Posting.created_at, Posting.id)
+            .limit(limit)
+            .offset(offset)
+        )
+    ).all()
+
+    return [
+        StatementEntry(
+            transaction_id=posting.transaction_id,
+            posting_id=posting.id,
+            direction=Direction(posting.direction),
+            amount=minor_to_decimal(int(posting.amount), exponent),
+            balance_after=minor_to_decimal(int(posting.balance_after), exponent),
+            currency=posting.currency_code,
+            description=description,
+            created_at=posting.created_at,
+        )
+        for posting, description in rows
+    ]
 
 
 async def trial_balance(
