@@ -37,11 +37,26 @@ npm run dev          # http://localhost:5173
 Open the app, paste the tenant API key on the connect screen, then go to
 **Simulator → Seed demo portfolio**.
 
+## Deploy (Vercel)
+
+1. Edit `vercel.json` so the rewrite `destination` points at your deployed
+   backend URL (e.g. `https://<your-app>.onrender.com/:path*`).
+2. Import this repo into Vercel — Vite is auto-detected (`npm run build` → `dist`).
+3. Set **no environment variables**: Vite inlines them into the public bundle, so
+   the API key must stay in the Settings screen (browser `localStorage`), never
+   in the build.
+4. Deploy, open the URL, and paste the tenant API key on the connect screen.
+
+See the backend README's **Deployment** section for the full Render + Neon setup.
+
 ## How it talks to the backend
 
-- The backend ships **no CORS middleware**, so the Vite dev server proxies
-  everything under `/api` to `http://localhost:8000` (see `vite.config.ts`).
-  Override the target with `FINLEDGER_API_URL=… npm run dev`.
+- The backend ships **no CORS middleware**, so the app stays same-origin and
+  calls `/api/*`:
+  - **Dev:** the Vite dev server proxies `/api` to `http://localhost:8000` (see
+    `vite.config.ts`). Override the target with `FINLEDGER_API_URL=… npm run dev`.
+  - **Production:** `vercel.json` rewrites `/api/*` to the deployed Render URL.
+    No CORS needed; nothing in the bundle points cross-origin.
 - The API key lives only in this browser's `localStorage` and is sent as the
   `X-API-Key` header. It is never written to the repo.
 - **Money is handled as decimal strings end-to-end** (`src/lib/money.ts`),
