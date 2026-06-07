@@ -118,6 +118,79 @@ docker compose up --build
 
 ---
 
+## Deployment (production)
+
+FinLedger runs as a **long-lived container against managed Postgres** — not
+serverless. The live free-tier stack:
+
+| Tier     | Platform            | Notes                                          |
+|----------|---------------------|------------------------------------------------|
+| API      | **Render** (Docker) | Builds this repo's `Dockerfile`; free plan     |
+| Database | **Neon** (Postgres) | Managed, point-in-time recovery, scale-to-zero |
+| Frontend | **Vercel** (`web/`) | Static Vite build; reaches the API via rewrite |
+
+### 1. Database — Neon
+
+Create a Neon project and copy its connection string, then convert it for this
+app's async driver. **Three edits, all required:**
+
+- scheme `postgresql://` → `postgresql+asyncpg://`
+- use the **direct** endpoint (drop `-pooler` from the host) — the app keeps its
+  own SQLAlchemy pool, and Neon's pooled PgBouncer endpoint breaks asyncpg's
+  prepared statements
+- replace the query `?sslmode=require&channel_binding=require` → `?ssl=require`
+  (asyncpg understands neither `sslmode` nor `channel_binding`)
+
+```
+postgresql+asyncpg://USER:PASSWORD@ep-xxxx.REGION.aws.neon.tech/neondb?ssl=require
+```
+
+> A mangled host (e.g. a newline from a wrapped copy-paste) surfaces as
+> `SSLV3_ALERT_ILLEGAL_PARAMETER` — Neon routes by SNI, so a broken hostname is
+> rejected during the TLS handshake, not as a connect error.
+
+### 2. Backend — Render
+
+A `render.yaml` Blueprint is included. In Render → **New → Blueprint**, point it
+at this repo; it provisions a Docker web service (free plan, health check
+`GET /health`, listens on `PORT=8000`). Set the one secret in the dashboard (it
+is `sync: false` in the blueprint):
+
+```
+FINLEDGER_DATABASE_URL = <the converted asyncpg URL from step 1>
+```
+
+> **Gotcha:** paste the **converted** URL, not Neon's raw `postgresql://` string.
+> The raw form makes SQLAlchemy fall back to psycopg2 →
+> `ModuleNotFoundError: No module named 'psycopg2'` at the migration step.
+
+The container entrypoint runs `alembic upgrade head` on every boot, so migrations
+apply automatically as the release step. Mint a tenant + key from the Render
+**Shell**:
+
+```bash
+finledger create-tenant "My Company"   # copy the sk_live_… (shown once)
+```
+
+### 3. Frontend — Vercel
+
+The `web/` app calls `/api/*`, and `web/vercel.json` rewrites that to the Render
+URL — so the browser stays **same-origin** and the backend needs no CORS. Import
+`web/` into Vercel (Vite is auto-detected), set **no environment variables** (the
+API key is entered in the app's Settings screen, never baked into the public
+bundle), and deploy. Paste the `sk_live_…` key into Settings to connect.
+
+### Secrets & ops
+
+- Keep `FINLEDGER_DATABASE_URL` and API keys in the platform secret stores, never
+  in the repo. Rotate any secret that has ever been pasted into a chat/log.
+- Render's free plan **sleeps after ~15 min idle** — the first request then takes
+  ~30–50s (cold start). Upgrade the service to keep it always-on.
+- Pushing to `main` auto-deploys both tiers; schema changes ship by committing a
+  new Alembic migration (Render applies it on the next deploy).
+
+---
+
 ## API walkthrough
 
 All `/v1/*` endpoints require an API key via `X-API-Key` or
