@@ -1,4 +1,5 @@
-# FinLedger — Portfolio Simulator (web)
+
+q# FinLedger — Portfolio Simulator (web)
 
 A Vite + React client for the FinLedger double-entry backend. It holds **no
 accounting logic** of its own — every balance, transaction, and rule comes from
