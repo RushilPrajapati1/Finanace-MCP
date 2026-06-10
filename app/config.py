@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     db_max_overflow: int = 20
     db_echo: bool = False
 
+    # Only honour X-Forwarded-For when the app sits behind a trusted reverse
+    # proxy (Render, nginx, ...). When false, the header is ignored and the
+    # direct peer address is used, so clients cannot forge the audit source_ip.
+    trust_proxy_headers: bool = False
+
 
 @lru_cache
 def get_settings() -> Settings:

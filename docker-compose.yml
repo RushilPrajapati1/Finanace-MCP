@@ -6,7 +6,9 @@ services:
       POSTGRES_PASSWORD: finledger
       POSTGRES_DB: finledger
     ports:
-      - "5432:5432"
+      # Bind to loopback only — the dev password is weak, so don't expose
+      # Postgres to the local network.
+      - "127.0.0.1:5432:5432"
     volumes:
       - finledger_pgdata:/var/lib/postgresql/data
     healthcheck:

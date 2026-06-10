@@ -9,6 +9,7 @@ from fastapi import Depends, Header, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.db import get_session
 from app.domain.errors import AuthenticationError
 from app.models import ApiKey, Tenant
@@ -51,11 +52,18 @@ async def _resolve_api_key(
 
 
 def _client_ip(request: Request) -> str | None:
-    """Best-effort request origin. Prefers the left-most ``X-Forwarded-For`` hop
-    (the original client) when behind a proxy, else the direct peer."""
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip() or None
+    """Best-effort request origin for the audit trail.
+
+    ``X-Forwarded-For`` is client-controlled, so it is only consulted when the
+    operator declares a trusted reverse proxy in front of the app
+    (``FINLEDGER_TRUST_PROXY_HEADERS=true``) — and then only the right-most hop
+    is used, because that is the one appended by the trusted proxy itself; the
+    left-most entries can be forged by the caller. Otherwise the TCP peer
+    address is used directly."""
+    if get_settings().trust_proxy_headers:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            return forwarded.rsplit(",", 1)[-1].strip() or None
     return request.client.host if request.client else None
 
 

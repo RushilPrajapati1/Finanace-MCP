@@ -16,6 +16,10 @@ COPY migrations ./migrations
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# Run as an unprivileged user; the app only needs to read its own code.
+RUN useradd --system --no-create-home appuser
+USER appuser
+
 EXPOSE 8000
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
