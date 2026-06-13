@@ -1,4 +1,4 @@
-.PHONY: help install dev db-up db-down migrate downgrade revision run test lint format up
+.PHONY: help install dev db-up db-down migrate downgrade revision run test lint format up mcp-install mcp-dev
 
 DB_URL ?= postgresql+asyncpg://finledger:finledger@localhost:5432/finledger
 TEST_DB_URL ?= postgresql+asyncpg://finledger:finledger@localhost:5432/finledger_test
@@ -11,7 +11,13 @@ install:  ## Install runtime dependencies
 	pip install .
 
 dev:  ## Install dev + runtime dependencies
-	pip install -e ".[dev]"
+	pip install -e ".[dev,mcp]"
+
+mcp-install:  ## Install MCP server dependencies only
+	pip install -e ".[mcp]"
+
+mcp-dev:  ## Run MCP server with Inspector (needs FINLEDGER_API_KEY)
+	mcp dev app/mcp/server.py
 
 db-up:  ## Start a local Postgres via docker compose
 	docker compose up -d db

@@ -118,6 +118,65 @@ docker compose up --build
 
 ---
 
+## MCP server (AI assistants)
+
+FinLedger exposes a **Model Context Protocol** server so tools like Cursor and
+Claude can query balances, transaction history, trial balance, portfolio
+rollups, and ledger integrity in natural language.
+
+### Setup
+
+```bash
+# 1. Backend prerequisites (Postgres + migrations + tenant key)
+make db-up
+make dev          # installs mcp[cli] alongside dev deps
+make migrate
+finledger create-tenant "My Company"   # copy the API key
+
+# 2. Configure the key (copy .env.example → .env, or export directly)
+export FINLEDGER_API_KEY="sk_live_..."
+export FINLEDGER_DATABASE_URL="postgresql+asyncpg://finledger:finledger@localhost:5432/finledger"
+
+# 3. Test with MCP Inspector
+make mcp-dev
+```
+
+### Cursor integration
+
+The workspace ships `.cursor/mcp.json`. After creating your tenant key:
+
+1. Edit `.cursor/mcp.json` and replace `PASTE_YOUR_TENANT_API_KEY_HERE`
+2. Create a venv in `Finanace-MCP` if you have not already:
+   ```bash
+   cd Finanace-MCP
+   python -m venv .venv
+   .venv\Scripts\activate        # Windows
+   make dev
+   ```
+3. Restart Cursor (or reload MCP servers in settings)
+
+### MCP tools
+
+| Tool | Purpose |
+| --- | --- |
+| `list_accounts` | Chart of accounts |
+| `get_account_balance` | Balance for one account |
+| `get_account_statement` | Posting history with running balances |
+| `list_transactions` | Recent journal entries |
+| `get_trial_balance` | Debit/credit totals per currency |
+| `verify_ledger_integrity` | Detect balance drift |
+| `get_portfolio_summary` | Net worth and P&L by currency |
+
+Run directly (stdio):
+
+```bash
+python -m app.mcp
+# or
+finledger-mcp
+```
+
+---
+
 ## Deployment (production)
 
 FinLedger runs as a **long-lived container against managed Postgres** — not
