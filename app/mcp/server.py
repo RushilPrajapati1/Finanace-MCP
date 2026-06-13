@@ -1,28 +1,37 @@
 """FinLedger MCP server — exposes ledger data and analysis to AI assistants.
 
-Run (stdio, for Cursor / Claude Desktop):
-    python -m app.mcp
+Two transports share this one server and tool set:
 
-Run with MCP Inspector (dev):
-    mcp dev app/mcp/server.py
+* **stdio** (local desktop: Cursor / Claude Desktop) — single tenant from the
+  ``FINLEDGER_API_KEY`` env var::
+
+      python -m app.mcp                 # or: mcp dev app/mcp/server.py
+
+* **streamable HTTP** (hosted AI clients / backend agents) — mounted by the
+  FastAPI app at ``/mcp`` (see ``app/main.py``); each request authenticates with
+  its own ``X-API-Key`` / ``Authorization: Bearer`` header, so one server serves
+  many tenants. This is *not* for the browser — the ``web/`` UI keeps calling
+  ``/v1/...``.
 
 Requires:
     FINLEDGER_DATABASE_URL  — Postgres connection string
-    FINLEDGER_API_KEY       — tenant API key from `finledger create-tenant`
+    FINLEDGER_API_KEY       — tenant API key (stdio transport only)
 """
 
 from __future__ import annotations
 
 import uuid
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.config import get_settings
 from app.db import SessionLocal
 from app.domain.errors import LedgerError
-from app.mcp.auth import resolve_tenant
+from app.mcp.auth import resolve_tenant_for_context
 from app.mcp.portfolio import portfolio_summary
 from app.mcp.serializers import (
     account_dict,
@@ -35,6 +44,24 @@ from app.models import Currency, Transaction
 from app.services import accounts as account_service
 from app.services import balances as balance_service
 
+def _transport_security() -> TransportSecuritySettings | None:
+    """Build DNS-rebinding protection for the HTTP transport from config.
+
+    Returns ``None`` (SDK default: localhost only) unless the operator has
+    declared the public host/origin, which is required once the server is
+    reachable at a real domain or MCP requests are rejected with 421.
+    """
+    settings = get_settings()
+    hosts = settings.mcp_allowed_hosts_list
+    origins = settings.mcp_allowed_origins_list
+    if not hosts and not origins:
+        return None
+    return TransportSecuritySettings(
+        allowed_hosts=hosts or ["127.0.0.1:*", "localhost:*"],
+        allowed_origins=origins or ["http://127.0.0.1:*", "http://localhost:*"],
+    )
+
+
 mcp = FastMCP(
     "FinLedger",
     instructions=(
@@ -42,21 +69,26 @@ mcp = FastMCP(
         "transaction history, trial balance, portfolio rollups (net worth and "
         "P&L), and ledger integrity. All amounts are decimal strings."
     ),
+    # The FastAPI app mounts this server's ASGI app at /mcp, so the streamable
+    # endpoint lives at the mount root ("/") within the sub-app -> /mcp on the API.
+    streamable_http_path="/",
+    transport_security=_transport_security(),
 )
 
 
-async def _with_session(fn):
-    """Open a DB session, resolve the tenant, and run ``fn(session, tenant)``."""
+async def _with_session(ctx: Context, fn):
+    """Open a DB session, resolve the calling tenant from the request context
+    (HTTP header) or the env var (stdio), and run ``fn(session, tenant)``."""
     async with SessionLocal() as session:
         try:
-            tenant = await resolve_tenant(session)
+            tenant = await resolve_tenant_for_context(session, ctx)
             return await fn(session, tenant)
         except LedgerError as exc:
             return {"error": exc.__class__.__name__, "message": str(exc)}
 
 
 @mcp.tool()
-async def list_accounts(limit: int = 50) -> dict:
+async def list_accounts(ctx: Context, limit: int = 50) -> dict:
     """List chart-of-accounts entries for the authenticated tenant."""
     limit = max(1, min(limit, 200))
 
@@ -66,11 +98,11 @@ async def list_accounts(limit: int = 50) -> dict:
         )
         return {"accounts": [account_dict(a) for a in accounts]}
 
-    return await _with_session(run)
+    return await _with_session(ctx, run)
 
 
 @mcp.tool()
-async def get_account_balance(account_id: str) -> dict:
+async def get_account_balance(ctx: Context, account_id: str) -> dict:
     """Get the current balance for one account by UUID."""
     try:
         aid = uuid.UUID(account_id)
@@ -81,12 +113,12 @@ async def get_account_balance(account_id: str) -> dict:
         view = await balance_service.get_account_balance(session, tenant.id, aid)
         return balance_dict(view)
 
-    return await _with_session(run)
+    return await _with_session(ctx, run)
 
 
 @mcp.tool()
 async def get_account_statement(
-    account_id: str, limit: int = 25, offset: int = 0
+    ctx: Context, account_id: str, limit: int = 25, offset: int = 0
 ) -> dict:
     """Get chronological postings for an account with running balances."""
     try:
@@ -103,11 +135,11 @@ async def get_account_statement(
         )
         return {"entries": [statement_dict(e) for e in entries]}
 
-    return await _with_session(run)
+    return await _with_session(ctx, run)
 
 
 @mcp.tool()
-async def list_transactions(limit: int = 25, offset: int = 0) -> dict:
+async def list_transactions(ctx: Context, limit: int = 25, offset: int = 0) -> dict:
     """List recent journal transactions with their postings."""
     limit = max(1, min(limit, 100))
     offset = max(0, offset)
@@ -143,30 +175,30 @@ async def list_transactions(limit: int = 25, offset: int = 0) -> dict:
             ]
         }
 
-    return await _with_session(run)
+    return await _with_session(ctx, run)
 
 
 @mcp.tool()
-async def get_trial_balance() -> dict:
+async def get_trial_balance(ctx: Context) -> dict:
     """Return per-currency debit/credit totals. A healthy ledger balances to zero."""
     async def run(session: AsyncSession, tenant):
         trial = await balance_service.trial_balance(session, tenant.id)
         return trial_balance_dict(trial)
 
-    return await _with_session(run)
+    return await _with_session(ctx, run)
 
 
 @mcp.tool()
-async def verify_ledger_integrity() -> dict:
+async def verify_ledger_integrity(ctx: Context) -> dict:
     """Recompute balances from postings and detect drift from materialised totals."""
     async def run(session: AsyncSession, tenant):
         return await balance_service.verify_integrity(session, tenant.id)
 
-    return await _with_session(run)
+    return await _with_session(ctx, run)
 
 
 @mcp.tool()
-async def get_portfolio_summary() -> dict:
+async def get_portfolio_summary(ctx: Context) -> dict:
     """Roll up net worth (assets − liabilities) and P&L (revenue − expenses) by currency."""
     async def run(session: AsyncSession, tenant):
         rows = await portfolio_summary(session, tenant.id)
@@ -185,7 +217,7 @@ async def get_portfolio_summary() -> dict:
             ]
         }
 
-    return await _with_session(run)
+    return await _with_session(ctx, run)
 
 
 @mcp.prompt()
