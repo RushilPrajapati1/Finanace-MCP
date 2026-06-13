@@ -21,7 +21,7 @@ journal entries, and watch net worth / P&L roll up in real time.
 The FinLedger backend running on `http://localhost:8000` with a tenant API key:
 
 ```bash
-# from ../Finanace MCP
+# from ../Finanace-MCP
 DB="postgresql+asyncpg://finledger:finledger@localhost:5432/finledger"
 FINLEDGER_DATABASE_URL="$DB" .venv/bin/alembic upgrade head
 FINLEDGER_DATABASE_URL="$DB" .venv/bin/finledger create-tenant "My Company"   # copy the key
