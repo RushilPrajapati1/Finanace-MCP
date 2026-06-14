@@ -25,6 +25,14 @@ services:
       # trusted (right-most hop) for the transaction audit trail.
       - key: FINLEDGER_TRUST_PROXY_HEADERS
         value: "true"
+      # Streamable-HTTP MCP server (mounted at /mcp). The MCP SDK's DNS-rebinding
+      # protection validates the Host/Origin of each request; list this service's
+      # public domain or MCP requests are rejected with 421. Update both if the
+      # Render URL changes.
+      - key: FINLEDGER_MCP_ALLOWED_HOSTS
+        value: "finledger-api-rw1f.onrender.com"
+      - key: FINLEDGER_MCP_ALLOWED_ORIGINS
+        value: "https://finledger-api-rw1f.onrender.com"
       # The Dockerfile's CMD listens on 8000; tell Render to route/health-check 8000.
       - key: PORT
         value: "8000"

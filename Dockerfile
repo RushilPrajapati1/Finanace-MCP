@@ -9,7 +9,10 @@ WORKDIR /app
 # Install dependencies first for better layer caching.
 COPY pyproject.toml README.md ./
 COPY app ./app
-RUN pip install --upgrade pip && pip install .
+# Install with the [mcp] extra so the streamable-HTTP MCP server (mounted at
+# /mcp by app/main.py) ships in the image; without it the mount is silently
+# skipped and /mcp returns 404.
+RUN pip install --upgrade pip && pip install ".[mcp]"
 
 COPY alembic.ini ./
 COPY migrations ./migrations
