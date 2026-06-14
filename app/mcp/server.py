@@ -72,6 +72,12 @@ mcp = FastMCP(
     # The FastAPI app mounts this server's ASGI app at /mcp, so the streamable
     # endpoint lives at the mount root ("/") within the sub-app -> /mcp on the API.
     streamable_http_path="/",
+    # Reply with plain JSON instead of an SSE stream. Our tools are all
+    # request/response (no server streaming), so this loses nothing and lets
+    # simpler clients connect: JSON mode only requires `Accept: application/json`
+    # rather than `application/json, text/event-stream`. Full MCP clients still
+    # work (they accept both).
+    json_response=True,
     transport_security=_transport_security(),
 )
 
