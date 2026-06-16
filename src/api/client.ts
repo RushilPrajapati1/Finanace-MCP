@@ -20,19 +20,13 @@ const API_KEY_STORAGE = 'finledger.apiKey'
 const BASE_URL_STORAGE = 'finledger.baseUrl'
 const DEFAULT_BASE_URL = '/api'
 
-// 👉 PUT YOUR API KEY HERE: web/.env.local  →  VITE_FINLEDGER_API_KEY=sk_live_...
-// Optional local-dev convenience: a key set in web/.env.local as
-// VITE_FINLEDGER_API_KEY is used as the default when nothing is saved in this
-// browser. localStorage (the Settings screen) always takes precedence, so you
-// can still override or rotate the key in the UI without touching the file.
-//
-// Dev-only on purpose: in a production build Vite would inline the key as a
-// plain string in the public JS bundle, leaking it to every visitor. So we
-// only read it under `import.meta.env.DEV`; production users enter their key
-// in Settings (localStorage).
-const ENV_API_KEY = import.meta.env.DEV
-  ? (import.meta.env.VITE_FINLEDGER_API_KEY ?? '').trim()
-  : ''
+// The API key is NOT held in the browser. When the app talks to the default
+// "/api" base, a server-side proxy injects the key for every request:
+//   - in production, the Vercel edge function in web/api/[...path].ts
+//   - in dev, the Vite proxy in vite.config.ts
+// Both read the key from a server-only env var (FINLEDGER_API_KEY), so it is
+// never bundled into the client. A browser key (Settings) is only needed when
+// the user points the app directly at a custom backend URL, bypassing the proxy.
 
 export class ApiError extends Error {
   code: string
@@ -46,7 +40,12 @@ export class ApiError extends Error {
 }
 
 export function getApiKey(): string {
-  return localStorage.getItem(API_KEY_STORAGE) ?? ENV_API_KEY
+  return localStorage.getItem(API_KEY_STORAGE) ?? ''
+}
+
+/** True when requests go through the key-injecting proxy (the default base). */
+export function usesServerKey(): boolean {
+  return getBaseUrl() === DEFAULT_BASE_URL
 }
 
 export function setApiKey(key: string): void {
@@ -63,8 +62,12 @@ export function setBaseUrl(url: string): void {
   else localStorage.removeItem(BASE_URL_STORAGE)
 }
 
+/**
+ * Whether the app can make authenticated calls: either the proxy injects the
+ * key (default), or a browser key is set for a direct/custom backend.
+ */
 export function hasApiKey(): boolean {
-  return getApiKey().trim().length > 0
+  return usesServerKey() || getApiKey().trim().length > 0
 }
 
 /** Stable client-side idempotency key for transaction POSTs. */
@@ -82,7 +85,9 @@ async function request<T>(
   const { method = 'GET', body, auth = true } = options
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (body !== undefined) headers['Content-Type'] = 'application/json'
-  if (auth) {
+  if (auth && !usesServerKey()) {
+    // Direct/custom-backend mode: the browser must supply the key itself.
+    // In the default proxy mode the server injects it, so we send nothing.
     const key = getApiKey()
     if (!key) throw new ApiError('no_api_key', 'No API key configured.', 0)
     headers['X-API-Key'] = key

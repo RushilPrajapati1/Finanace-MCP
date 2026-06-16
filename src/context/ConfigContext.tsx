@@ -9,6 +9,7 @@ import {
 import {
   getApiKey,
   getBaseUrl,
+  hasApiKey,
   setApiKey as persistKey,
   setBaseUrl as persistBaseUrl,
 } from '../api/client'
@@ -41,7 +42,10 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     () => ({
       apiKey,
       baseUrl,
-      configured: apiKey.trim().length > 0,
+      // Configured when the proxy injects the key (default) or a browser key is
+      // set for a direct/custom backend. `baseUrl`/`apiKey` are in the deps so
+      // this recomputes when either changes.
+      configured: hasApiKey(),
       setApiKey,
       setBaseUrl,
     }),
