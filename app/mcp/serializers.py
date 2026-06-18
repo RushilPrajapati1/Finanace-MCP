@@ -69,6 +69,26 @@ def trial_balance_dict(trial: TrialBalance) -> dict:
     }
 
 
+def transaction_preview_dict(preview) -> dict:
+    """Serialize a :class:`app.services.ledger.TransactionPreview` (dry-run result)."""
+    return {
+        "dry_run": True,
+        "balanced": preview.balanced,
+        "description": preview.description,
+        "balance_impact": [
+            {
+                "account_id": str(line.account_id),
+                "account": line.account_name,
+                "currency": line.currency,
+                "change": _money(line.change),
+                "balance_before": _money(line.balance_before),
+                "balance_after": _money(line.balance_after),
+            }
+            for line in preview.lines
+        ],
+    }
+
+
 def transaction_dict(transaction: Transaction, exponents: dict[str, int]) -> dict:
     from app.domain.money import minor_to_decimal
 

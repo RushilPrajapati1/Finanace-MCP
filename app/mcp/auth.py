@@ -12,13 +12,24 @@ Two transports, two auth sources:
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.domain.errors import AuthenticationError
 from app.models import ApiKey, Tenant
 from app.security import hash_api_key
+
+
+@dataclass(slots=True)
+class McpPrincipal:
+    """The authenticated caller plus the audit context for a write tool call."""
+
+    tenant: Tenant
+    api_key: ApiKey
+    source_ip: str | None
 
 
 def require_api_key() -> str:
@@ -45,8 +56,25 @@ def _api_key_from_request(request) -> str | None:
     return None
 
 
-async def resolve_tenant(session: AsyncSession, raw_key: str | None = None) -> Tenant:
-    """Resolve the calling tenant from an API key (header value or env-var)."""
+def _source_ip_from_request(request) -> str | None:
+    """Best-effort request origin for the audit trail (mirrors ``app/api/deps.py``).
+
+    ``X-Forwarded-For`` is client-controlled, so it is only trusted when the
+    operator has declared a reverse proxy (``FINLEDGER_TRUST_PROXY_HEADERS``);
+    then only the right-most hop is used. Otherwise the TCP peer is used.
+    """
+    if get_settings().trust_proxy_headers:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            return forwarded.rsplit(",", 1)[-1].strip() or None
+    client = getattr(request, "client", None)
+    return client.host if client else None
+
+
+async def _resolve_api_key_and_tenant(
+    session: AsyncSession, raw_key: str | None = None
+) -> tuple[ApiKey, Tenant]:
+    """Resolve a live (non-revoked) API key and its tenant from a raw key."""
     raw = raw_key or require_api_key()
     api_key = await session.scalar(
         select(ApiKey).where(
@@ -60,6 +88,12 @@ async def resolve_tenant(session: AsyncSession, raw_key: str | None = None) -> T
     tenant = await session.get(Tenant, api_key.tenant_id)
     if tenant is None:  # pragma: no cover - FK guarantees presence
         raise AuthenticationError("invalid API key")
+    return api_key, tenant
+
+
+async def resolve_tenant(session: AsyncSession, raw_key: str | None = None) -> Tenant:
+    """Resolve the calling tenant from an API key (header value or env-var)."""
+    _, tenant = await _resolve_api_key_and_tenant(session, raw_key)
     return tenant
 
 
@@ -85,3 +119,28 @@ async def resolve_tenant_for_context(session: AsyncSession, ctx) -> Tenant:
 
     # stdio transport: single tenant from the server environment
     return await resolve_tenant(session)
+
+
+async def resolve_principal_for_context(session: AsyncSession, ctx) -> McpPrincipal:
+    """Resolve the calling principal for a *write* tool invocation.
+
+    Like :func:`resolve_tenant_for_context`, but also returns the API key and
+    request origin so the ledger can stamp the audit trail (which credential
+    posted, from where) — exactly what the REST router threads through.
+    """
+    request = getattr(ctx.request_context, "request", None) if ctx is not None else None
+
+    if request is not None:  # streamable-HTTP transport
+        raw = _api_key_from_request(request)
+        if not raw:
+            raise AuthenticationError(
+                "missing API key: send X-API-Key or Authorization: Bearer"
+            )
+        api_key, tenant = await _resolve_api_key_and_tenant(session, raw)
+        return McpPrincipal(
+            tenant=tenant, api_key=api_key, source_ip=_source_ip_from_request(request)
+        )
+
+    # stdio transport: single tenant from the server environment, no HTTP origin
+    api_key, tenant = await _resolve_api_key_and_tenant(session)
+    return McpPrincipal(tenant=tenant, api_key=api_key, source_ip=None)

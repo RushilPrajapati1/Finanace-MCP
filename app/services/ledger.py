@@ -34,7 +34,7 @@ from app.domain.errors import (
     UnbalancedTransactionError,
     ValidationError,
 )
-from app.domain.money import Money, MoneyError
+from app.domain.money import Money, MoneyError, minor_to_decimal
 from app.models import Account, AccountBalance, Currency, Posting, Transaction
 
 
@@ -303,6 +303,93 @@ async def post_transaction(
     refreshed = await _load_transaction(session, tenant_id, transaction.id)
     assert refreshed is not None
     return refreshed
+
+
+@dataclass(slots=True)
+class PreviewLine:
+    account_id: uuid.UUID
+    account_name: str
+    currency: str
+    change: Decimal
+    balance_before: Decimal
+    balance_after: Decimal
+
+
+@dataclass(slots=True)
+class TransactionPreview:
+    balanced: bool
+    description: str | None
+    lines: list[PreviewLine]
+
+
+async def preview_transaction(
+    session: AsyncSession,
+    tenant_id: uuid.UUID,
+    data: TransactionInput,
+) -> TransactionPreview:
+    """Validate a transaction and report its effect *without writing anything*.
+
+    Runs the exact same validation as :func:`post_transaction` (balancing per
+    currency, account/currency checks, positive amounts) and projects the
+    resulting per-account balances. Nothing is flushed, locked, or committed, so
+    this is a safe dry-run an agent can use to confirm before posting. Raises the
+    same :class:`LedgerError` subclasses a real post would.
+    """
+    account_ids = {line.account_id for line in data.postings}
+    accounts = {
+        a.id: a
+        for a in (
+            await session.scalars(
+                select(Account).where(
+                    Account.tenant_id == tenant_id, Account.id.in_(account_ids)
+                )
+            )
+        ).all()
+    }
+    exponents = await _exponents_for_accounts(session, accounts.values())
+
+    # Reuses the real validation core; raises on an unbalanced/invalid entry.
+    _rows, deltas = _build_postings(accounts, exponents, data.postings)
+
+    # Read current balances without locking — a preview must not block writers.
+    balances = {
+        b.account_id: b
+        for b in (
+            await session.scalars(
+                select(AccountBalance).where(AccountBalance.account_id.in_(deltas.keys()))
+            )
+        ).all()
+    }
+
+    lines: list[PreviewLine] = []
+    for account_id, (debit_delta, credit_delta) in deltas.items():
+        account = accounts[account_id]
+        account_type = AccountType(account.type)
+        if normal_balance(account_type) is Direction.DEBIT:
+            change_minor = debit_delta - credit_delta
+        else:
+            change_minor = credit_delta - debit_delta
+
+        balance = balances.get(account_id)
+        before_minor = (
+            _signed_balance(balance, account_type) if balance is not None else 0
+        )
+        after_minor = before_minor + change_minor
+        exponent = exponents[account.currency_code]
+        lines.append(
+            PreviewLine(
+                account_id=account_id,
+                account_name=account.name,
+                currency=account.currency_code,
+                change=minor_to_decimal(change_minor, exponent),
+                balance_before=minor_to_decimal(before_minor, exponent),
+                balance_after=minor_to_decimal(after_minor, exponent),
+            )
+        )
+
+    return TransactionPreview(
+        balanced=True, description=data.description, lines=lines
+    )
 
 
 async def reverse_transaction(
