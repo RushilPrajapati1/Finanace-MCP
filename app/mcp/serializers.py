@@ -97,7 +97,7 @@ def transaction_dict(transaction: Transaction, exponents: dict[str, int]) -> dic
         "description": transaction.description,
         "external_id": transaction.external_id,
         "idempotency_key": transaction.idempotency_key,
-        "reversal_of": str(transaction.reversal_of) if transaction.reversal_of else None,
+        "reversal_of": str(transaction.reverses_transaction_id) if transaction.reverses_transaction_id else None,
         "created_at": transaction.created_at.isoformat(),
         "postings": [
             {
