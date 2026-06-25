@@ -7,7 +7,6 @@ from decimal import Decimal
 from app.models import Account, Transaction
 from app.services.balances import (
     AccountBalanceView,
-    CurrencyTotals,
     StatementEntry,
     TrialBalance,
 )
@@ -87,6 +86,108 @@ def transaction_preview_dict(preview) -> dict:
             for line in preview.lines
         ],
     }
+
+
+def validation_result_dict(result) -> dict:
+    """Serialize a :class:`app.services.ledger.ValidationResult` (dry-run check)."""
+    out = {
+        "valid": result.valid,
+        "errors": result.errors,
+        "computed_totals": result.computed_totals,
+    }
+    if result.preview is not None:
+        out["balance_impact"] = transaction_preview_dict(result.preview)["balance_impact"]
+    return out
+
+
+def _report_line(line) -> dict:
+    return {
+        "account_id": str(line.account_id),
+        "account": line.account_name,
+        "type": line.account_type,
+        "amount": _money(line.amount),
+    }
+
+
+def income_statement_dict(statement) -> dict:
+    return {
+        "start_date": statement.start.isoformat() if statement.start else None,
+        "end_date": statement.end.isoformat() if statement.end else None,
+        "currencies": [
+            {
+                "currency": c.currency,
+                "revenue": [_report_line(line) for line in c.revenue],
+                "expenses": [_report_line(line) for line in c.expenses],
+                "total_revenue": _money(c.total_revenue),
+                "total_expenses": _money(c.total_expenses),
+                "net_income": _money(c.net_income),
+            }
+            for c in statement.currencies
+        ],
+    }
+
+
+def balance_sheet_dict(sheet) -> dict:
+    return {
+        "as_of_date": sheet.as_of.isoformat(),
+        "currencies": [
+            {
+                "currency": c.currency,
+                "assets": [_report_line(line) for line in c.assets],
+                "liabilities": [_report_line(line) for line in c.liabilities],
+                "equity": [_report_line(line) for line in c.equity],
+                "total_assets": _money(c.total_assets),
+                "total_liabilities": _money(c.total_liabilities),
+                "total_equity": _money(c.total_equity),
+                "retained_earnings": _money(c.retained_earnings),
+                "balanced": c.balanced,
+            }
+            for c in sheet.currencies
+        ],
+    }
+
+
+def balance_history_dict(account_id: str, granularity: str, points) -> dict:
+    return {
+        "account_id": account_id,
+        "granularity": granularity,
+        "points": [
+            {"period": p.period, "closing_balance": _money(p.closing_balance)}
+            for p in points
+        ],
+    }
+
+
+def import_results_dict(results) -> dict:
+    summary: dict[str, int] = {"created": 0, "skipped": 0, "error": 0}
+    rows = []
+    for r in results:
+        summary[r.status] = summary.get(r.status, 0) + 1
+        row = {
+            "index": r.index,
+            "external_id": r.external_id,
+            "status": r.status,
+        }
+        if r.account is not None:
+            row["account_id"] = str(r.account.id)
+        if r.error is not None:
+            row["error"] = r.error
+        rows.append(row)
+    return {"results": rows, "summary": summary}
+
+
+def batch_results_dict(results, exponents: dict[str, int]) -> dict:
+    summary: dict[str, int] = {}
+    rows = []
+    for r in results:
+        summary[r.status] = summary.get(r.status, 0) + 1
+        row = {"index": r.index, "status": r.status}
+        if r.transaction is not None:
+            row["transaction"] = transaction_dict(r.transaction, exponents)
+        if r.error is not None:
+            row["error"] = r.error
+        rows.append(row)
+    return {"results": rows, "summary": summary}
 
 
 def transaction_dict(transaction: Transaction, exponents: dict[str, int]) -> dict:

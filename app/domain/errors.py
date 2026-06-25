@@ -68,6 +68,13 @@ class DuplicateAccountError(LedgerError):
     status_code = 409
 
 
+class AccountNotEmptyError(LedgerError):
+    """The account cannot be deactivated while it still holds a non-zero balance."""
+
+    code = "account_not_empty"
+    status_code = 409
+
+
 class TransactionNotFoundError(LedgerError):
     """No such transaction for this tenant."""
 

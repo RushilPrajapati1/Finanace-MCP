@@ -16,9 +16,10 @@ from __future__ import annotations
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import Numeric, cast, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -30,6 +31,7 @@ from app.domain.errors import (
     CurrencyMismatchError,
     CurrencyNotFoundError,
     InactiveAccountError,
+    LedgerError,
     TransactionNotFoundError,
     UnbalancedTransactionError,
     ValidationError,
@@ -228,28 +230,28 @@ def _build_postings(
     return rows, {k: (v[0], v[1]) for k, v in deltas.items()}
 
 
-async def post_transaction(
+async def _post_transaction_staged(
     session: AsyncSession,
     tenant_id: uuid.UUID,
     data: TransactionInput,
     *,
     api_key_id: uuid.UUID | None = None,
     source_ip: str | None = None,
-) -> Transaction:
-    """Validate and atomically post a balanced transaction.
+) -> tuple[Transaction, bool]:
+    """Build and write one transaction **without committing**.
 
-    Idempotent on ``idempotency_key``: replaying a request with a key already
-    seen for this tenant returns the original transaction and posts nothing new.
-
-    ``api_key_id`` and ``source_ip`` are the server-derived audit context (which
-    credential, from where); ``data.actor`` is the caller-supplied principal.
+    Returns ``(transaction, replayed)``. When ``replayed`` is true the
+    ``idempotency_key`` already existed for this tenant and the returned
+    transaction is the original — nothing new was written. Shared by
+    :func:`post_transaction` (commit-per-call) and
+    :func:`batch_post_transactions` (one commit for the whole batch).
     """
     if data.idempotency_key:
         existing = await _find_by_idempotency_key(
             session, tenant_id, data.idempotency_key
         )
         if existing is not None:
-            return existing
+            return existing, True
 
     account_ids = {line.account_id for line in data.postings}
     accounts = {
@@ -286,6 +288,30 @@ async def post_transaction(
         rows=rows,
         deltas=deltas,
     )
+    return transaction, False
+
+
+async def post_transaction(
+    session: AsyncSession,
+    tenant_id: uuid.UUID,
+    data: TransactionInput,
+    *,
+    api_key_id: uuid.UUID | None = None,
+    source_ip: str | None = None,
+) -> Transaction:
+    """Validate and atomically post a balanced transaction.
+
+    Idempotent on ``idempotency_key``: replaying a request with a key already
+    seen for this tenant returns the original transaction and posts nothing new.
+
+    ``api_key_id`` and ``source_ip`` are the server-derived audit context (which
+    credential, from where); ``data.actor`` is the caller-supplied principal.
+    """
+    transaction, replayed = await _post_transaction_staged(
+        session, tenant_id, data, api_key_id=api_key_id, source_ip=source_ip
+    )
+    if replayed:
+        return transaction
 
     try:
         await session.commit()
@@ -303,6 +329,115 @@ async def post_transaction(
     refreshed = await _load_transaction(session, tenant_id, transaction.id)
     assert refreshed is not None
     return refreshed
+
+
+@dataclass(slots=True)
+class BatchItemResult:
+    index: int
+    status: str  # 'posted' | 'replayed' | 'error' | 'rolled_back'
+    transaction: Transaction | None = None
+    error: dict | None = None
+
+
+async def batch_post_transactions(
+    session: AsyncSession,
+    tenant_id: uuid.UUID,
+    items: list[TransactionInput],
+    *,
+    atomic: bool = True,
+    api_key_id: uuid.UUID | None = None,
+    source_ip: str | None = None,
+) -> list[BatchItemResult]:
+    """Post many transactions in one call.
+
+    ``atomic=True`` (default): every item is staged in a single database
+    transaction and committed once — if any item is invalid the **whole batch is
+    rolled back** (the offending item is reported as ``error``, the rest as
+    ``rolled_back``). ``atomic=False``: best-effort per item, each isolated by a
+    savepoint, so a bad item fails alone and the good ones still commit.
+    """
+    results: list[BatchItemResult] = []
+
+    if atomic:
+        staged: list[tuple[int, Transaction, bool]] = []
+        try:
+            for index, data in enumerate(items):
+                txn, replayed = await _post_transaction_staged(
+                    session, tenant_id, data,
+                    api_key_id=api_key_id, source_ip=source_ip,
+                )
+                staged.append((index, txn, replayed))
+            await session.commit()
+        except LedgerError as exc:
+            await session.rollback()
+            failed = len(staged)  # index that raised
+            results = [
+                BatchItemResult(index=i, status="rolled_back")
+                for i in range(len(items))
+            ]
+            results[failed] = BatchItemResult(
+                index=failed,
+                status="error",
+                error={"code": exc.code, "message": str(exc)},
+            )
+            return results
+        except IntegrityError as exc:
+            await session.rollback()
+            return [
+                BatchItemResult(
+                    index=i,
+                    status="error",
+                    error={
+                        "code": "validation_error",
+                        "message": f"batch could not be committed: {exc.orig}",
+                    },
+                )
+                for i in range(len(items))
+            ]
+
+        for index, txn, replayed in staged:
+            refreshed = await _load_transaction(session, tenant_id, txn.id)
+            results.append(
+                BatchItemResult(
+                    index=index,
+                    status="replayed" if replayed else "posted",
+                    transaction=refreshed,
+                )
+            )
+        return results
+
+    # Best-effort: isolate each item in its own savepoint.
+    for index, data in enumerate(items):
+        try:
+            async with session.begin_nested():
+                txn, replayed = await _post_transaction_staged(
+                    session, tenant_id, data,
+                    api_key_id=api_key_id, source_ip=source_ip,
+                )
+            results.append(
+                BatchItemResult(
+                    index=index,
+                    status="replayed" if replayed else "posted",
+                    transaction=txn,
+                )
+            )
+        except LedgerError as exc:
+            results.append(
+                BatchItemResult(
+                    index=index,
+                    status="error",
+                    error={"code": exc.code, "message": str(exc)},
+                )
+            )
+    await session.commit()
+
+    # Re-load committed transactions so their postings are available.
+    for result in results:
+        if result.transaction is not None:
+            result.transaction = await _load_transaction(
+                session, tenant_id, result.transaction.id
+            )
+    return results
 
 
 @dataclass(slots=True)
@@ -512,6 +647,177 @@ async def get_transaction(
     if transaction is None:
         raise TransactionNotFoundError(f"transaction {transaction_id} not found")
     return transaction
+
+
+@dataclass(slots=True)
+class TransactionSearchResult:
+    transactions: list[Transaction]
+    total_count: int
+
+
+async def search_transactions(
+    session: AsyncSession,
+    tenant_id: uuid.UUID,
+    *,
+    account_id: uuid.UUID | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    min_amount: Decimal | None = None,
+    max_amount: Decimal | None = None,
+    description_query: str | None = None,
+    currency: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> TransactionSearchResult:
+    """Filtered transaction query with AND semantics, applied in the database.
+
+    All filters are optional and combinable. The posting-level filters
+    (``account_id``, ``currency``, ``min_amount``, ``max_amount``) match a
+    transaction that has **at least one posting** satisfying them together;
+    ``start``/``end`` and ``description_query`` match the transaction header.
+    Amount thresholds are compared in each posting's own currency (the minor-unit
+    amount is scaled back to a decimal via the currency exponent), so they are
+    exact and currency-aware.
+
+    Returns the page of transactions (newest first) plus the total match count
+    for pagination.
+    """
+    has_posting_filter = (
+        account_id is not None
+        or currency is not None
+        or min_amount is not None
+        or max_amount is not None
+    )
+    has_amount_filter = min_amount is not None or max_amount is not None
+
+    conditions = [Transaction.tenant_id == tenant_id]
+    if start is not None:
+        conditions.append(Transaction.created_at >= start)
+    if end is not None:
+        conditions.append(Transaction.created_at < end)
+    if description_query is not None:
+        conditions.append(Transaction.description.ilike(f"%{description_query}%"))
+    if account_id is not None:
+        conditions.append(Posting.account_id == account_id)
+    if currency is not None:
+        conditions.append(Posting.currency_code == currency.upper())
+    if has_amount_filter:
+        # Posting.amount is in minor units; scale the decimal threshold up by the
+        # currency's exponent (all numeric, no float) to compare like-for-like.
+        scale = func.power(cast(10, Numeric), cast(Currency.exponent, Numeric))
+        if min_amount is not None:
+            conditions.append(Posting.amount >= cast(min_amount, Numeric) * scale)
+        if max_amount is not None:
+            conditions.append(Posting.amount <= cast(max_amount, Numeric) * scale)
+
+    def _scoped(stmt):
+        if has_posting_filter:
+            stmt = stmt.join(Posting, Posting.transaction_id == Transaction.id)
+            if has_amount_filter:
+                stmt = stmt.join(Currency, Currency.code == Posting.currency_code)
+        return stmt.where(*conditions)
+
+    total = await session.scalar(
+        _scoped(select(func.count(func.distinct(Transaction.id))))
+    )
+
+    # Select id + created_at (DISTINCT requires the ORDER BY key in the columns).
+    id_rows = (
+        await session.execute(
+            _scoped(select(Transaction.id, Transaction.created_at).distinct())
+            .order_by(Transaction.created_at.desc(), Transaction.id)
+            .limit(limit)
+            .offset(offset)
+        )
+    ).all()
+    ids = [row[0] for row in id_rows]
+
+    if not ids:
+        return TransactionSearchResult(transactions=[], total_count=int(total or 0))
+
+    loaded = {
+        txn.id: txn
+        for txn in (
+            await session.scalars(
+                select(Transaction)
+                .where(Transaction.id.in_(ids))
+                .options(selectinload(Transaction.postings))
+            )
+        ).all()
+    }
+    ordered = [loaded[i] for i in ids if i in loaded]
+    return TransactionSearchResult(transactions=ordered, total_count=int(total or 0))
+
+
+@dataclass(slots=True)
+class ValidationResult:
+    valid: bool
+    errors: list[dict]
+    computed_totals: list[dict]
+    preview: TransactionPreview | None
+
+
+async def validate_transaction(
+    session: AsyncSession,
+    tenant_id: uuid.UUID,
+    data: TransactionInput,
+) -> ValidationResult:
+    """Dry-run a transaction: report whether it *would* post, without writing.
+
+    Runs the same validation as :func:`post_transaction` (>=2 postings, balanced
+    per currency, accounts exist + active, currency agreement, positive amounts).
+    Unlike a real post it never raises on a bad entry — it captures the failure
+    in ``errors`` so a caller can inspect every problem structurally. Writes
+    nothing.
+    """
+    try:
+        preview = await preview_transaction(session, tenant_id, data)
+    except LedgerError as exc:
+        return ValidationResult(
+            valid=False,
+            errors=[{"code": exc.code, "message": str(exc)}],
+            computed_totals=[],
+            preview=None,
+        )
+
+    # Recompute per-currency debit/credit totals for the caller's confirmation.
+    account_ids = {line.account_id for line in data.postings}
+    accounts = {
+        a.id: a
+        for a in (
+            await session.scalars(
+                select(Account).where(
+                    Account.tenant_id == tenant_id, Account.id.in_(account_ids)
+                )
+            )
+        ).all()
+    }
+    exponents = await _exponents_for_accounts(session, accounts.values())
+    totals: dict[str, dict[Direction, int]] = defaultdict(
+        lambda: {Direction.DEBIT: 0, Direction.CREDIT: 0}
+    )
+    for line in data.postings:
+        account = accounts[line.account_id]
+        money = Money.from_decimal(
+            line.amount, account.currency_code, exponents[account.currency_code]
+        )
+        totals[account.currency_code][line.direction] += money.minor_units
+
+    computed_totals = [
+        {
+            "currency": code,
+            "debits": format(
+                minor_to_decimal(sides[Direction.DEBIT], exponents[code]), "f"
+            ),
+            "credits": format(
+                minor_to_decimal(sides[Direction.CREDIT], exponents[code]), "f"
+            ),
+        }
+        for code, sides in sorted(totals.items())
+    ]
+    return ValidationResult(
+        valid=True, errors=[], computed_totals=computed_totals, preview=preview
+    )
 
 
 async def _exponents_for_accounts(
