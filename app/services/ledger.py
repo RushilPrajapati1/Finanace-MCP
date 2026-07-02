@@ -696,7 +696,16 @@ async def search_transactions(
     if end is not None:
         conditions.append(Transaction.created_at < end)
     if description_query is not None:
-        conditions.append(Transaction.description.ilike(f"%{description_query}%"))
+        # Escape LIKE metacharacters so caller-supplied `%`/`_` match literally
+        # instead of acting as wildcards (pattern injection / pathological scans).
+        escaped = (
+            description_query.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        conditions.append(
+            Transaction.description.ilike(f"%{escaped}%", escape="\\")
+        )
     if account_id is not None:
         conditions.append(Posting.account_id == account_id)
     if currency is not None:

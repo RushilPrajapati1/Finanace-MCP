@@ -33,6 +33,7 @@ integrations = [
 finledger = "app.cli:main"
 finledger-mcp = "app.mcp.__main__:main"
 finledger-import-opencollective = "app.integrations.opencollective:main"
+finledger-import-plaid = "app.integrations.plaid.demo:main"
 
 [build-system]
 requires = ["setuptools>=68"]

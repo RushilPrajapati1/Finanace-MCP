@@ -25,6 +25,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Numeric,
@@ -116,6 +117,10 @@ class Account(Base):
 
     __table_args__ = (
         UniqueConstraint("tenant_id", "external_id", name="uq_accounts_tenant_external"),
+        # Composite key target so child tables (postings, account_balances) can
+        # enforce at the database level that the rows they reference belong to
+        # the *same tenant* — the DB is the backstop for tenant isolation.
+        UniqueConstraint("id", "tenant_id", name="uq_accounts_id_tenant"),
         CheckConstraint(
             "type IN ('asset','liability','equity','revenue','expense')",
             name="ck_accounts_type",
@@ -135,13 +140,13 @@ class AccountBalance(Base):
 
     __tablename__ = "account_balances"
 
-    account_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("accounts.id", ondelete="CASCADE"), primary_key=True
-    )
+    account_id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True)
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    currency_code: Mapped[str] = mapped_column(String(8), nullable=False)
+    currency_code: Mapped[str] = mapped_column(
+        ForeignKey("currencies.code"), nullable=False
+    )
     posted_debits: Mapped[int] = mapped_column(
         Amount, nullable=False, server_default="0", default=0
     )
@@ -156,6 +161,17 @@ class AccountBalance(Base):
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+    )
+
+    __table_args__ = (
+        # Tenant-scoped FK: a balance row can only reference an account owned by
+        # the same tenant, enforced by the database itself.
+        ForeignKeyConstraint(
+            ["account_id", "tenant_id"],
+            ["accounts.id", "accounts.tenant_id"],
+            ondelete="CASCADE",
+            name="fk_account_balances_account_tenant",
+        ),
     )
 
 
@@ -174,7 +190,7 @@ class Transaction(Base):
     idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     external_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     reverses_transaction_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("transactions.id"), nullable=True
+        Uuid, nullable=True
     )
     # Audit trail: who/what created this transaction. ``api_key_id`` and
     # ``source_ip`` are server-derived (the resolved credential and request
@@ -203,6 +219,15 @@ class Transaction(Base):
         UniqueConstraint(
             "reverses_transaction_id", name="uq_transactions_reverses"
         ),
+        # Composite key target for tenant-scoped child FKs (postings, reversals).
+        UniqueConstraint("id", "tenant_id", name="uq_transactions_id_tenant"),
+        # A reversal can only point at a transaction in the *same tenant*;
+        # cross-tenant reversal references are rejected by the database.
+        ForeignKeyConstraint(
+            ["reverses_transaction_id", "tenant_id"],
+            ["transactions.id", "transactions.tenant_id"],
+            name="fk_transactions_reverses_tenant",
+        ),
         Index("ix_transactions_tenant_created", "tenant_id", "created_at"),
     )
 
@@ -214,12 +239,8 @@ class Posting(Base):
     __tablename__ = "postings"
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    transaction_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("transactions.id"), nullable=False
-    )
-    account_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("accounts.id"), nullable=False
-    )
+    transaction_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    account_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
@@ -241,6 +262,19 @@ class Posting(Base):
     transaction: Mapped[Transaction] = relationship(back_populates="postings")
 
     __table_args__ = (
+        # Tenant-scoped FKs: the database rejects a posting whose transaction or
+        # account belongs to a different tenant, so tenant isolation holds even
+        # against an application bug or a raw INSERT at a psql prompt.
+        ForeignKeyConstraint(
+            ["transaction_id", "tenant_id"],
+            ["transactions.id", "transactions.tenant_id"],
+            name="fk_postings_transaction_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["account_id", "tenant_id"],
+            ["accounts.id", "accounts.tenant_id"],
+            name="fk_postings_account_tenant",
+        ),
         CheckConstraint("direction IN ('debit','credit')", name="ck_postings_direction"),
         CheckConstraint("amount > 0", name="ck_postings_amount_positive"),
         Index("ix_postings_account", "account_id"),
